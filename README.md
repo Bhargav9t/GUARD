@@ -151,3 +151,5 @@ python evaluate.py --mode cross_dataset --benchmarks-dir data/benchmarks
 # Robustness degradation sweep (JPEG 90-30, blur, scaling)
 python evaluate.py --mode degradation_sweep --data-dir data/processed/test
 ```
+## Model Weights
+[Download guard_best.pth (116MB)](https://drive.google.com/file/d/1YhTbu3HncIBEllfH-vvzKN_kJEyu2hJV/view?usp=drive_link) and place it inside the `checkpoints/` folder.
