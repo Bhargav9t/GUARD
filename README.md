@@ -7,6 +7,7 @@
 GUARD is an end-to-end multi-modal deepfake and AI-generated image detection framework. By fusing spatial pixel-level forensics with frequency-domain spectral analysis through adaptive gated attention, GUARD delivers high generalization accuracy across GANs, Diffusion models, and varied social media degradations.
 
 > 📚 **Technical & Mathematical Documentation**:
+> - [**WEIGHTS_AND_BENCHMARK_RESULTS.md**](WEIGHTS_AND_BENCHMARK_RESULTS.md): Detailed registry of all checkpoint weights, parameter counts, download links, and full empirical benchmark evaluation tables.
 > - [**MATHEMATICAL_FOUNDATIONS_README.md**](MATHEMATICAL_FOUNDATIONS_README.md): Exhaustive mathematical formulations for 2D FFT, power-law decay, Poisson sensor noise, SE attention, W-MSA complexity, gated gradient flow proofs, and temporal continuity.
 > - [**TECHNICAL_DEPTH_AND_CAPABILITIES.md**](TECHNICAL_DEPTH_AND_CAPABILITIES.md): In-depth system architecture, multi-backbone consensus, latency budgets, benchmark metrics, and generator coverage.
 > - [**CODE_SNIPPETS_README.md**](CODE_SNIPPETS_README.md): Detailed code snippets for the dual-stream model, 2D FFT/DCT layer, gated fusion, explainability, and video forensics.
