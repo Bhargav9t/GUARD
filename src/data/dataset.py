@@ -128,7 +128,7 @@ class GUARDDataset(Dataset):
             face_detected = processed["face_detected"]
         else:
             # Fallback loading without face alignment
-            img_rgb = FaceAligner().load_image(img_path)
+            img_rgb = FaceAligner.load_image(img_path)
             face_detected = False
 
         # 2. Apply Albumentations augmentation pipeline & convert to tensor (3, H, W)

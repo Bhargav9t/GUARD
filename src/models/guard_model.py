@@ -251,6 +251,14 @@ class GUARDModel(nn.Module):
         # Extract independent stream breakdown
         stream_breakdown = self.compute_stream_breakdown(x)
 
+        # Dual-pathway parallel scorer combination (Score Fusion Mode)
+        # Combines spatial stream score and frequency stream score using dynamic gating weights
+        sp_prob = stream_breakdown.get("spatial_prob", prob)
+        fq_prob = stream_breakdown.get("frequency_prob", prob)
+        dual_score = (gate_score * sp_prob) + ((1.0 - gate_score) * fq_prob)
+        stream_breakdown["combined_dual_score"] = dual_score
+        stream_breakdown["dual_score_fake"] = bool(dual_score >= thresh)
+
         # Return comprehensive inference payload
         return {
             "is_fake": is_fake,
@@ -263,7 +271,86 @@ class GUARDModel(nn.Module):
             "spatial_gating_ratio": gate_score,
             "frequency_gating_ratio": 1.0 - gate_score,
             "stream_breakdown": stream_breakdown,
+            "combined_dual_score": dual_score,
         }
+
+    def compute_gradcam(
+        self,
+        x: torch.Tensor,
+        target_class: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Computes Grad-CAM (Gradient-Weighted Class Activation Mapping) on the spatial feature maps.
+        Highlights the exact spatial regions (blending seams, warping, unnatural skin micro-textures)
+        that drove the model's decision (artifact evidence map).
+
+        Parameters:
+            x (torch.Tensor): Input image tensor of shape (1, 3, H, W) or (3, H, W).
+            target_class (Optional[int]): 1 for Fake class attribution, 0 for Real class attribution.
+                If None, attributes with respect to the active predicted class.
+
+        Returns:
+            torch.Tensor: Grad-CAM heatmap tensor of shape (1, 1, H_cam, W_cam) in [0.0, 1.0].
+        """
+        self.eval()
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+
+        x_in = x.clone().detach()
+
+        # Temporarily enable gradients for Grad-CAM
+        with torch.enable_grad():
+            # 1. Forward through spatial stream up to feature maps
+            spatial_fmaps = self.spatial_stream.forward_features(x_in)
+            spatial_fmaps.requires_grad_(True)
+            spatial_fmaps.retain_grad()
+
+            # 2. Pool spatial features to 1D vector
+            pooled_spatial = torch.mean(spatial_fmaps, dim=(-2, -1))
+            proj_spatial = self.spatial_stream.proj(pooled_spatial)
+
+            # 3. Frequency stream forward
+            f_frequency = self.frequency_stream(x_in)
+
+            # 4. Fusion and classification head
+            f_fused, _ = self.fusion(proj_spatial, f_frequency)
+            logit = self.head(f_fused)[0, 0]
+            prob = torch.sigmoid(logit)
+
+            # 5. Determine target score
+            # If Fake (prob >= 0.5) or target_class == 1, target is +logit
+            # If Real (prob < 0.5) or target_class == 0, target is -logit
+            if target_class is None:
+                target_score = logit if prob.item() >= 0.5 else -logit
+            elif target_class == 1:
+                target_score = logit
+            else:
+                target_score = -logit
+
+            # 6. Backward pass to compute gradients with respect to spatial feature maps
+            self.zero_grad()
+            target_score.backward(retain_graph=False)
+
+            grads = spatial_fmaps.grad
+            if grads is not None:
+                # Global average pooling of gradients: channel importance weights alpha_k
+                alpha = torch.mean(grads, dim=(-2, -1), keepdim=True)
+                # Weighted linear combination
+                cam = torch.sum(alpha * spatial_fmaps, dim=1, keepdim=True)
+                # Apply ReLU: only features that positively correlate with the target class
+                cam = torch.relu(cam)
+                # Normalize between 0 and 1
+                c_min, c_max = cam.min(), cam.max()
+                if c_max > c_min:
+                    cam = (cam - c_min) / (c_max - c_min + 1e-8)
+                else:
+                    cam = torch.zeros_like(cam)
+                return cam.detach()
+            else:
+                # Fallback to normalized channel mean
+                mean_cam = torch.mean(spatial_fmaps, dim=1, keepdim=True)
+                m_min, m_max = mean_cam.min(), mean_cam.max()
+                return ((mean_cam - m_min) / (m_max - m_min + 1e-8)).detach()
 
     def extract_explainability_data(
         self,
@@ -273,8 +360,8 @@ class GUARDModel(nn.Module):
         """
         Extracts multi-modal forensic inspection assets for the UI Dashboard:
           - 2D Fourier Magnitude Spectrum map.
-          - 2D Spatial Feature activation map.
-          - Multi-modal Gating ratio breakdown and stream metrics.
+          - 2D Grad-CAM Spatial Artifact Evidence Heatmap.
+          - Multi-modal Gating ratio breakdown and dual-stream metrics.
 
         Parameters:
             x (torch.Tensor): Input image tensor of shape (1, 3, H, W) or (3, H, W).
@@ -290,18 +377,21 @@ class GUARDModel(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
 
+        # 1. Standard prediction pass with active threshold
         with torch.no_grad():
-            # 1. Standard prediction pass with active threshold
             pred_info = self.predict(x, threshold=threshold)
 
             # 2. Extract 2D FFT Magnitude Spectrum (1, 3, H, W)
             spectrum = self.frequency_stream.compute_spectrum(x)
 
-            # 3. Extract 2D Spatial Feature Maps (1, 1792, 12, 12)
-            spatial_fmaps = self.spatial_stream.forward_features(x)
-
-            # Average across channels to produce single 2D spatial heatmap
-            spatial_heatmap = torch.mean(spatial_fmaps, dim=1, keepdim=True)
+        # 3. Compute Grad-CAM Spatial Artifact Heatmap
+        try:
+            spatial_heatmap = self.compute_gradcam(x, target_class=pred_info["predicted_class"])
+        except Exception as e:
+            app_logger.warning(f"Grad-CAM computation fallback: {e}")
+            with torch.no_grad():
+                spatial_fmaps = self.spatial_stream.forward_features(x)
+                spatial_heatmap = torch.mean(spatial_fmaps, dim=1, keepdim=True)
 
         # Return explainability assets
         return {

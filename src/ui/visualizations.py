@@ -52,7 +52,7 @@ def create_spectrum_display(
 ) -> np.ndarray:
     """
     Transforms a 2D Fourier log-magnitude spectrum map into a high-contrast
-    cyber false-color visualization for forensic frequency analysis.
+    false-color visualization for forensic frequency analysis.
 
     Parameters:
         spectrum_tensor (Union[torch.Tensor, np.ndarray]): 2D spectrum map (C, H, W) or (H, W).

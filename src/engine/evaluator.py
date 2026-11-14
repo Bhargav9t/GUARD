@@ -217,6 +217,180 @@ class GUARDEvaluator:
 
         return sweep_results
 
+    def run_three_condition_evaluation(
+        self,
+        benchmarks_dir: Union[str, Path] = "data/benchmarks",
+        test_dir: Union[str, Path] = "data/processed/test",
+        batch_size: int = 16,
+        max_samples: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executes rigorous evaluation across three fundamental forensic conditions:
+          Condition 1: Clean Images (FaceForensics++, Celeb-DF, DFDC, In-distribution test)
+          Condition 2: Degraded Images (JPEG recompression Q=85, 60, 35; Resizing 0.75x, 0.50x; Blur; Compound)
+          Condition 3: Unseen Generator Images (Synthesized by a generator unseen during training)
+        Directly measures and reports the Generalization Gap and Degradation Drop.
+
+        Parameters:
+            benchmarks_dir (Union[str, Path]): Directory containing benchmark subfolders.
+            test_dir (Union[str, Path]): Directory containing test real/fake images.
+            batch_size (int): Evaluation batch size.
+            max_samples (Optional[int]): Maximum balanced samples per benchmark (e.g. 40 = 20 real + 20 fake).
+
+        Returns:
+            Dict[str, Any]: Comprehensive three-condition forensic evaluation metrics.
+        """
+        b_path = Path(benchmarks_dir)
+        t_path = Path(test_dir)
+
+        def _balance_subsample(ds: GUARDDataset, max_n: Optional[int]) -> GUARDDataset:
+            if max_n is None or len(ds.samples) <= max_n:
+                return ds
+            half = max_n // 2
+            reals = [s for s in ds.samples if s[1] == 0][:half]
+            fakes = [s for s in ds.samples if s[1] == 1][:half]
+            ds.samples = reals + fakes
+            return ds
+
+        report = {
+            "condition_1_clean": {},
+            "condition_2_degraded": {},
+            "condition_3_unseen_generator": {},
+            "summary_comparison": {},
+        }
+
+        # ======================================================================
+        # CONDITION 1: CLEAN IMAGES (FF++, Celeb-DF, DFDC)
+        # ======================================================================
+        app_logger.info("=" * 70)
+        app_logger.info(">>> CONDITION 1: Evaluating on CLEAN Images (Uncorrupted)")
+        app_logger.info("=" * 70)
+
+        clean_benchmarks = {
+            "FaceForensics++": b_path / "FaceForensics++",
+            "Celeb-DF": b_path / "Celeb-DF",
+            "DFDC": b_path / "DFDC",
+        }
+        if t_path.exists():
+            clean_benchmarks["In-Distribution-Test"] = t_path
+
+        clean_accuracies = []
+        clean_aucs = []
+
+        for name, folder in clean_benchmarks.items():
+            if folder.exists():
+                ds = GUARDDataset(data_dir=folder, mode="val", target_size=(380, 380), enable_face_align=False)
+                ds = _balance_subsample(ds, max_samples)
+                if len(ds) > 0:
+                    loader = create_dataloader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
+                    metrics = self.evaluate_dataloader(loader, dataset_name=f"Clean-{name}")
+                    report["condition_1_clean"][name] = metrics
+                    clean_accuracies.append(metrics["accuracy"])
+                    clean_aucs.append(metrics["auc_roc"])
+
+        avg_clean_acc = float(np.mean(clean_accuracies)) if clean_accuracies else 0.0
+        avg_clean_auc = float(np.mean(clean_aucs)) if clean_aucs else 0.0
+        report["condition_1_clean"]["_aggregate"] = {
+            "average_accuracy": avg_clean_acc,
+            "average_auc_roc": avg_clean_auc,
+        }
+
+        # ======================================================================
+        # CONDITION 2: DEGRADED IMAGES (JPEG sweeps, Downscaling, Blur, Compound)
+        # ======================================================================
+        app_logger.info("=" * 70)
+        app_logger.info(">>> CONDITION 2: Evaluating on DEGRADED Images (Real-World Corruption)")
+        app_logger.info("=" * 70)
+
+        # Use in-distribution test or FF++ as source dataset for degradation testing
+        sweep_source_folder = t_path if t_path.exists() else (b_path / "FaceForensics++")
+        degraded_accuracies = []
+
+        if sweep_source_folder.exists():
+            base_ds = GUARDDataset(data_dir=sweep_source_folder, mode="val", target_size=(380, 380), enable_face_align=False)
+            base_ds = _balance_subsample(base_ds, max_samples)
+
+            degradation_configs = [
+                ("JPEG_Q85_Mild", {"jpeg_quality": 85}),
+                ("JPEG_Q60_Medium", {"jpeg_quality": 60}),
+                ("JPEG_Q35_Heavy", {"jpeg_quality": 35}),
+                ("Resizing_0.75x", {"downscale_scale": 0.75}),
+                ("Resizing_0.50x", {"downscale_scale": 0.50}),
+                ("Blur_Kernel_5", {"blur_limit": 5}),
+            ]
+
+            for deg_name, deg_params in degradation_configs:
+                base_ds.augmentation.transform = get_degradation_sweep_pipeline(
+                    jpeg_quality=deg_params.get("jpeg_quality"),
+                    blur_limit=deg_params.get("blur_limit"),
+                    downscale_scale=deg_params.get("downscale_scale"),
+                    target_size=(380, 380)
+                )
+                loader = create_dataloader(base_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+                metrics = self.evaluate_dataloader(loader, dataset_name=f"Degraded-{deg_name}")
+                report["condition_2_degraded"][deg_name] = metrics
+                degraded_accuracies.append(metrics["accuracy"])
+
+        # Check for pre-rendered degraded test folder
+        degraded_folder = Path("data/processed/test_degraded")
+        if degraded_folder.exists():
+            ds_deg = GUARDDataset(data_dir=degraded_folder, mode="val", target_size=(380, 380), enable_face_align=False)
+            ds_deg = _balance_subsample(ds_deg, max_samples)
+            if len(ds_deg) > 0:
+                loader = create_dataloader(ds_deg, batch_size=batch_size, shuffle=False, num_workers=0)
+                metrics = self.evaluate_dataloader(loader, dataset_name="Compound_JPEG50_Resize0.7x")
+                report["condition_2_degraded"]["Compound_JPEG50_Resize0.7x"] = metrics
+                degraded_accuracies.append(metrics["accuracy"])
+
+        avg_degraded_acc = float(np.mean(degraded_accuracies)) if degraded_accuracies else 0.0
+        report["condition_2_degraded"]["_aggregate"] = {
+            "average_accuracy": avg_degraded_acc,
+            "degradation_drop": avg_clean_acc - avg_degraded_acc,
+        }
+
+        # ======================================================================
+        # CONDITION 3: UNSEEN GENERATOR IMAGES (Generalization Gap)
+        # ======================================================================
+        app_logger.info("=" * 70)
+        app_logger.info(">>> CONDITION 3: Evaluating on UNSEEN GENERATOR Images")
+        app_logger.info("=" * 70)
+
+        unseen_folder = b_path / "Unseen_Generator"
+        unseen_acc = 0.0
+        unseen_auc = 0.0
+
+        if unseen_folder.exists():
+            ds_unseen = GUARDDataset(data_dir=unseen_folder, mode="val", target_size=(380, 380), enable_face_align=False)
+            ds_unseen = _balance_subsample(ds_unseen, max_samples)
+            if len(ds_unseen) > 0:
+                loader = create_dataloader(ds_unseen, batch_size=batch_size, shuffle=False, num_workers=0)
+                metrics = self.evaluate_dataloader(loader, dataset_name="Unseen-Generator-Benchmark")
+                report["condition_3_unseen_generator"]["Unseen_Generator"] = metrics
+                unseen_acc = metrics["accuracy"]
+                unseen_auc = metrics["auc_roc"]
+
+        generalization_gap = avg_clean_acc - unseen_acc
+
+        report["summary_comparison"] = {
+            "condition_1_clean_accuracy": avg_clean_acc,
+            "condition_1_clean_auc": avg_clean_auc,
+            "condition_2_degraded_accuracy": avg_degraded_acc,
+            "condition_2_degradation_drop": avg_clean_acc - avg_degraded_acc,
+            "condition_3_unseen_generator_accuracy": unseen_acc,
+            "condition_3_unseen_generator_auc": unseen_auc,
+            "generalization_gap": generalization_gap,
+        }
+
+        app_logger.info("=" * 70)
+        app_logger.info(">>> THREE-CONDITION EVALUATION COMPLETE")
+        app_logger.info(f"    - Clean Images Accuracy:            {avg_clean_acc * 100:.2f}% (AUC: {avg_clean_auc:.4f})")
+        app_logger.info(f"    - Degraded Images Accuracy:         {avg_degraded_acc * 100:.2f}% (Drop: {(avg_clean_acc - avg_degraded_acc) * 100:.2f}%)")
+        app_logger.info(f"    - Unseen Generator Accuracy:        {unseen_acc * 100:.2f}% (AUC: {unseen_auc:.4f})")
+        app_logger.info(f"    - Visible Generalization Gap:       {generalization_gap * 100:.2f}%")
+        app_logger.info("=" * 70)
+
+        return report
+
     def save_report(
         self,
         report_data: Dict[str, Any],

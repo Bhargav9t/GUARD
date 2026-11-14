@@ -133,6 +133,30 @@ def parse_args() -> argparse.Namespace:
         help="Number of synthetic samples to generate per class if dataset is empty."
     )
 
+    # Backbone freeze toggle for transfer learning acceleration
+    parser.add_argument(
+        "--unfreeze-backbone",
+        action="store_true",
+        default=False,
+        help="Unfreeze EfficientNet-B4 spatial backbone for full end-to-end fine-tuning."
+    )
+
+    # Maximum samples per class to train on (useful for quick balanced subsets)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples per class to load from dataset (e.g. 500)."
+    )
+
+    # Skip Haar face detection if dataset images are already cropped face portraits
+    parser.add_argument(
+        "--no-face-align",
+        action="store_true",
+        default=False,
+        help="Bypass Haar cascade face detection if dataset already contains cropped face portraits."
+    )
+
     return parser.parse_args()
 
 
@@ -428,6 +452,10 @@ def main() -> None:
     )
 
     print(f"[+] Total samples discovered: {len(real_images)} Real, {len(fake_images)} Fake.")
+    if args.max_samples is not None:
+        real_images = real_images[:args.max_samples]
+        fake_images = fake_images[:args.max_samples]
+        print(f"[*] Subsampling applied: Using {len(real_images)} Real and {len(fake_images)} Fake samples.")
 
     # 5. Build balanced labeled sample pairs (Path, label)
     all_samples: List[Tuple[Path, int]] = []
@@ -448,17 +476,20 @@ def main() -> None:
     print(f"[*] Dataset partition: {len(train_samples)} Train samples, {len(val_samples)} Validation samples.")
 
     # 7. Instantiate PyTorch Datasets
+    use_face_align = not args.no_face_align
+    print(f"[*] Automated Face Alignment during loading: {'Enabled' if use_face_align else 'Bypassed (Pre-cropped portraits)'}")
+
     train_dataset = GUARDDataset(
         samples=train_samples,
         mode="train",
-        enable_face_align=True,
+        enable_face_align=use_face_align,
         target_size=(380, 380)
     )
 
     val_dataset = GUARDDataset(
         samples=val_samples,
         mode="val",
-        enable_face_align=True,
+        enable_face_align=use_face_align,
         target_size=(380, 380)
     )
 
@@ -485,15 +516,25 @@ def main() -> None:
     # 9. Instantiate GUARD Master Model Architecture
     print("\n[*] Assembling dual-stream GUARD architecture (EfficientNet-B4 + FFT/DCT + Gated Residual Fusion)...")
     model = GUARDModel(config=default_config)
+    
+    # Freeze backbone if requested (transfer learning best practice)
+    if not args.unfreeze_backbone:
+        model.spatial_stream.freeze_backbone()
+        print("[*] EfficientNet-B4 spatial backbone FROZEN for transfer learning.")
+    else:
+        print("[*] EfficientNet-B4 spatial backbone UNFROZEN for full fine-tuning.")
+
     model.to(device)
 
     # 10. Loss Function and Optimizer
     criterion = nn.BCEWithLogitsLoss()
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay
     )
+    print(f"[*] Trainable parameters: {sum(p.numel() for p in trainable_params):,} / {sum(p.numel() for p in model.parameters()):,} total.")
 
     # 11. Learning Rate Scheduler with Warmup + Cosine Annealing
     # Warmup for first 2 epochs, then cosine decay down to 1e-6

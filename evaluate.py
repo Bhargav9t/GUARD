@@ -37,14 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        default="in_distribution",
-        choices=["in_distribution", "cross_dataset", "degradation_sweep"],
+        default="three_conditions",
+        choices=["three_conditions", "in_distribution", "cross_dataset", "degradation_sweep"],
         help="Evaluation protocol mode to execute."
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/guard_best.pth",
+        default="checkpoints/guard_model.pth",
         help="Path to saved model checkpoint weights (.pth)."
     )
     parser.add_argument(
@@ -71,8 +71,65 @@ def parse_args() -> argparse.Namespace:
         default="outputs/evaluation_report.json",
         help="Destination path for JSON metrics report."
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum balanced samples per benchmark evaluated (e.g. 40 = 20 real + 20 fake)."
+    )
 
     return parser.parse_args()
+
+
+def print_formatted_results(report: dict) -> None:
+    """
+    Renders an ASCII summary table for the three forensic evaluation conditions.
+    """
+    print("\n" + "=" * 82)
+    print(" GUARD FORENSIC EVALUATION BENCHMARK REPORT (MEASURED RESULTS)")
+    print("=" * 82)
+
+    # Condition 1
+    c1 = report.get("condition_1_clean", {})
+    print("\n [CONDITION 1: CLEAN IMAGES (UNCORRUPTED)]")
+    print(f" {'Benchmark / Dataset':<28} | {'Accuracy':<10} | {'AUC-ROC':<10} | {'EER':<10} | {'F1-Score':<10}")
+    print(" " + "-" * 80)
+    for name, metrics in c1.items():
+        if name.startswith("_"):
+            continue
+        print(f" {name:<28} | {metrics['accuracy']*100:6.2f}%    | {metrics['auc_roc']:8.4f}   | {metrics['eer']*100:6.2f}%    | {metrics['f1_score']:8.4f}")
+    c1_agg = c1.get("_aggregate", {})
+    if c1_agg:
+        print(" " + "-" * 80)
+        print(f" {'Average Clean Aggregate':<28} | {c1_agg['average_accuracy']*100:6.2f}%    | {c1_agg['average_auc_roc']:8.4f}   | {'--':<10} | {'--':<10}")
+
+    # Condition 2
+    c2 = report.get("condition_2_degraded", {})
+    print("\n [CONDITION 2: DEGRADED IMAGES (REAL-WORLD CORRUPTIONS)]")
+    print(f" {'Degradation Perturbation':<28} | {'Accuracy':<10} | {'AUC-ROC':<10} | {'EER':<10} | {'F1-Score':<10}")
+    print(" " + "-" * 80)
+    for name, metrics in c2.items():
+        if name.startswith("_"):
+            continue
+        print(f" {name:<28} | {metrics['accuracy']*100:6.2f}%    | {metrics['auc_roc']:8.4f}   | {metrics['eer']*100:6.2f}%    | {metrics['f1_score']:8.4f}")
+    c2_agg = c2.get("_aggregate", {})
+    if c2_agg:
+        print(" " + "-" * 80)
+        print(f" {'Average Degraded Accuracy':<28} | {c2_agg['average_accuracy']*100:6.2f}%    | {'Drop:':<8} {c2_agg['degradation_drop']*100:5.2f}%")
+
+    # Condition 3
+    c3 = report.get("condition_3_unseen_generator", {})
+    summary = report.get("summary_comparison", {})
+    print("\n [CONDITION 3: UNSEEN GENERATOR & GENERALIZATION GAP]")
+    print(f" {'Generator Architecture':<28} | {'Accuracy':<10} | {'AUC-ROC':<10} | {'EER':<10} | {'F1-Score':<10}")
+    print(" " + "-" * 80)
+    for name, metrics in c3.items():
+        if name.startswith("_"):
+            continue
+        print(f" {name:<28} | {metrics['accuracy']*100:6.2f}%    | {metrics['auc_roc']:8.4f}   | {metrics['eer']*100:6.2f}%    | {metrics['f1_score']:8.4f}")
+    print(" " + "-" * 80)
+    print(f" Generalization Gap (Clean In-Dist vs Unseen Gen): {summary.get('generalization_gap', 0.0)*100:+.2f}%")
+    print("=" * 82 + "\n")
 
 
 def main() -> None:
@@ -83,11 +140,20 @@ def main() -> None:
     print_device_summary()
     device = get_device()
 
+    # Checkpoint fallback handling
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.exists():
+        fallback_best = Path("checkpoints/guard_best.pth")
+        if fallback_best.exists():
+            ckpt_path = fallback_best
+        else:
+            app_logger.warning(f"No checkpoint found at {ckpt_path}. Model will evaluate with initialized weights.")
+
     # 1. Initialize master GUARD architecture
     model = GUARDModel()
     evaluator = GUARDEvaluator(
         model=model,
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=ckpt_path if ckpt_path.exists() else None,
         device=device
     )
 
@@ -95,7 +161,17 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 2. Execute selected evaluation protocol
-    if args.mode == "in_distribution":
+    if args.mode == "three_conditions":
+        results = evaluator.run_three_condition_evaluation(
+            benchmarks_dir=args.benchmarks_dir,
+            test_dir=args.data_dir,
+            batch_size=args.batch_size,
+            max_samples=args.max_samples,
+        )
+        evaluator.save_report(results, out_path)
+        print_formatted_results(results)
+
+    elif args.mode == "in_distribution":
         data_path = Path(args.data_dir)
         if not data_path.exists():
             app_logger.warning(
@@ -109,7 +185,7 @@ def main() -> None:
             app_logger.warning(f"No valid images discovered in: {data_path}")
             sys.exit(0)
 
-        loader = create_dataloader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+        loader = create_dataloader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
         results = evaluator.evaluate_dataloader(loader, dataset_name="In-Distribution-Test")
         evaluator.save_report(results, out_path)
 
@@ -117,9 +193,9 @@ def main() -> None:
         bench_path = Path(args.benchmarks_dir)
         benchmarks = {
             "FaceForensics++": bench_path / "FaceForensics++",
-            "Celeb-DF-v2": bench_path / "Celeb-DF-v2",
+            "Celeb-DF": bench_path / "Celeb-DF",
             "DFDC": bench_path / "DFDC",
-            "DiffusionForensics": bench_path / "DiffusionForensics",
+            "Unseen_Generator": bench_path / "Unseen_Generator",
         }
         results = evaluator.run_cross_dataset_evaluation(benchmarks, batch_size=args.batch_size)
         evaluator.save_report(results, out_path)

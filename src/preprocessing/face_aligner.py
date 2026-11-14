@@ -48,12 +48,18 @@ class FaceAligner:
         # Minimum confidence threshold for valid face detections
         self.confidence_threshold = self.config.confidence_threshold
 
-        # Locate OpenCV cascade files across different distribution layouts (Miniforge/Conda vs pip)
-        cascade_dir = self._find_cascade_dir()
-        
         self.face_cascade = None
         self.eye_cascade = None
+        self._load_cascades()
 
+        app_logger.info(
+            f"FaceAligner initialized: TargetSize={self.target_size}, "
+            f"CropMargin={self.crop_margin}, Enabled={self.config.enable_face_crop}"
+        )
+
+    def _load_cascades(self) -> None:
+        """Loads Haar cascade classifiers if available."""
+        cascade_dir = self._find_cascade_dir()
         if cascade_dir is not None:
             face_xml = os.path.join(cascade_dir, "haarcascade_frontalface_default.xml")
             eye_xml = os.path.join(cascade_dir, "haarcascade_eye.xml")
@@ -67,10 +73,18 @@ class FaceAligner:
         else:
             app_logger.warning("FaceAligner: Cascade detector not found. Operating in automatic center-crop mode.")
 
-        app_logger.info(
-            f"FaceAligner initialized: TargetSize={self.target_size}, "
-            f"CropMargin={self.crop_margin}, Enabled={self.config.enable_face_crop}"
-        )
+    def __getstate__(self) -> Dict[str, Any]:
+        """Custom pickling for multi-worker DataLoader support on Windows."""
+        state = self.__dict__.copy()
+        # CascadeClassifier is an unpicklable C++ pointer; exclude from serialization
+        state["face_cascade"] = None
+        state["eye_cascade"] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Reconstruct state and re-initialize cascades in spawned worker process."""
+        self.__dict__.update(state)
+        self._load_cascades()
 
     @staticmethod
     def _find_cascade_dir() -> Optional[str]:
@@ -109,7 +123,8 @@ class FaceAligner:
 
         return None
 
-    def load_image(self, image_input: Union[str, np.ndarray]) -> np.ndarray:
+    @staticmethod
+    def load_image(image_input: Union[str, np.ndarray]) -> np.ndarray:
         """
         Loads an image from a file path or validates an existing NumPy array.
         Always returns an RGB image array with shape (H, W, 3) and dtype uint8.

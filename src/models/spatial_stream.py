@@ -12,6 +12,7 @@
 # ==============================================================================
 
 from typing import Optional, Tuple, Dict, Any
+import math
 import torch
 import torch.nn as nn
 import timm
@@ -86,9 +87,7 @@ class SpatialStream(nn.Module):
         # 2. Register normalization module
         self.normalize = ImageNetNormalize(mean=self.config.mean, std=self.config.std)
 
-        # 3. Instantiate EfficientNet-B4 via timm
-        # Setting num_classes=0 removes the final linear classification layer,
-        # retaining global average pooling to yield a 1D feature embedding vector.
+        # 3. Instantiate Backbone (EfficientNet, Swin, ViT) via timm
         try:
             self.backbone = timm.create_model(
                 self.backbone_name,
@@ -96,6 +95,11 @@ class SpatialStream(nn.Module):
                 num_classes=0,
                 drop_rate=self.dropout_rate,
             )
+            # Dynamically resolve feature dimensionality from backbone
+            detected_dim = getattr(self.backbone, 'num_features', getattr(self.backbone, 'head_hidden_size', None))
+            if detected_dim is not None:
+                self.feature_dim = detected_dim
+
             app_logger.info(
                 f"SpatialStream initialized: Backbone={self.backbone_name}, "
                 f"Pretrained={self.config.pretrained}, OutputDim={self.feature_dim}"
@@ -103,7 +107,7 @@ class SpatialStream(nn.Module):
         except Exception as e:
             # Fallback for offline environments where downloading weights might time out
             app_logger.warning(
-                f"Could not download pretrained weights for {self.backbone_name} ({e}). "
+                f"Could not initialize {self.backbone_name} with pretrained weights ({e}). "
                 f"Initializing backbone with random weights."
             )
             self.backbone = timm.create_model(
@@ -112,6 +116,9 @@ class SpatialStream(nn.Module):
                 num_classes=0,
                 drop_rate=self.dropout_rate,
             )
+            detected_dim = getattr(self.backbone, 'num_features', getattr(self.backbone, 'head_hidden_size', None))
+            if detected_dim is not None:
+                self.feature_dim = detected_dim
 
         # 4. Feature projection layer with Layer Normalization and Dropout
         # Refines spatial features before feeding into the cross-modal fusion stage
@@ -131,22 +138,35 @@ class SpatialStream(nn.Module):
 
     def forward_features(self, x: torch.Tensor, apply_norm: bool = True) -> torch.Tensor:
         """
-        Extracts 2D unpooled convolutional feature maps from the backbone.
-        Useful for spatial attention visualization, heatmaps, or Grad-CAM.
+        Extracts 2D unpooled convolutional/token feature maps from the backbone.
+        Uniformly reshapes outputs to (B, C, H', W') for Grad-CAM and spatial attention maps.
 
         Parameters:
             x (torch.Tensor): Input batch of images (B, 3, H, W) in [0.0, 1.0].
             apply_norm (bool): Whether to apply ImageNet normalization. Default is True.
 
         Returns:
-            torch.Tensor: Feature maps of shape (B, C, H', W'), where C = feature_dim.
+            torch.Tensor: Feature maps of shape (B, C, H', W').
         """
-        # Apply normalization if requested
         if apply_norm:
             x = self.normalize(x)
 
-        # Extract 2D convolutional features from backbone prior to global pooling
+        # Extract 2D convolutional features or vision transformer tokens
         feature_maps = self.backbone.forward_features(x)
+
+        # Handle Vision Transformer / Swin token outputs (B, N, C) -> (B, C, H, W)
+        if feature_maps.ndim == 3:
+            b, n, c = feature_maps.shape
+            side = int(math.isqrt(n))
+            if side * side == n:
+                feature_maps = feature_maps.permute(0, 2, 1).contiguous().view(b, c, side, side)
+            else:
+                # If non-square sequence length (e.g. prepended CLS token in ViT)
+                if (n - 1) > 0:
+                    side_cls = int(math.isqrt(n - 1))
+                    if side_cls * side_cls == (n - 1):
+                        feature_maps = feature_maps[:, 1:, :].permute(0, 2, 1).contiguous().view(b, c, side_cls, side_cls)
+
         return feature_maps
 
     def forward(self, x: torch.Tensor, apply_norm: bool = True) -> torch.Tensor:
